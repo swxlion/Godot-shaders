@@ -1,0 +1,197 @@
+[gd_resource type="Shader" format=2]
+
+[resource]
+code = "shader_type spatial;
+render_mode depth_draw_always,cull_disabled;
+
+uniform sampler2D diffuseTex : hint_albedo;
+uniform sampler2D nosieTex;
+uniform sampler2D maskTex;
+
+uniform float furLength = 0.4;
+uniform float tenacityFactor : hint_range(0.0, 1.0) = 0.9;
+uniform int sampleCount = 20;
+
+uniform vec2 UVScale = vec2(1.0, 1.0);
+uniform vec2 nosieUVScale = vec2(1.0, 1.0);				//-- 此参数亦可调节毛发粗细。
+uniform vec2 maskUVScale = vec2(1.0, 1.0);				//-- 此参数亦可调节毛发粗细。
+
+uniform vec3 lightWorldPos = vec3(0.0, 60.0, 0.0);
+uniform vec4 lightColor : hint_color = vec4(1.0, 1.0, 1.0, 1.0);
+
+uniform float ambient_factor : hint_range(0.0, 1.0) = 0.1;
+uniform float shininess : hint_range(0.01, 256.0) = 32.0;		//-- specular 高光幂系数
+uniform float specular_factor : hint_range(0.0, 1.0) = 0.2;     // Blinn-Phong 光照模型下的 高光颜色
+
+uniform float rimPower : hint_range(0.0, 8.0) = 6.0;			//-- 往小调，效果才明显
+uniform vec4 rimColor : hint_color = vec4(0.0, 0.0, 0.0, 1.0);
+
+uniform float furShading : hint_range(0.0, 1.0) = 0.01;			//-- 毛发阴影
+//uniform float furThinness : hint_range(0.01, 10.0) = 1.0;		//-- 毛发粗细。与 nosieUVScale 参数完全相同。
+//uniform float furDensity : hint_range(0.0, 10.0) = 0.1;			//-- 毛发密度/绒毛程度。
+
+uniform float gravityStrength = 0.0;
+uniform vec3 gravityDirection = vec3(0.0, 0.0, 0.0);
+uniform float forceStrength = 0.0;
+uniform vec3 forceDirection = vec3(0.0, 0.0, 0.0);
+
+uniform bool expandShell = false;
+uniform bool enableMode = false;
+
+//varying vec3 worldPosition;
+varying vec3 worldNormal;
+varying vec3 worldTangent;
+varying vec3 worldBinormal;
+varying vec2 nosieUV;
+varying vec2 maskUV;
+
+//---------------
+
+varying mat3 TBN;
+varying vec3 TangentLightPos;
+varying vec3 TangentFragmentPos;
+
+void vertex()
+{
+	nosieUV = UV * nosieUVScale;
+	maskUV = UV * maskUVScale;
+	UV *= UVScale;
+
+	//worldPosition = normalize(mat3(WORLD_MATRIX) * VERTEX);
+	worldNormal = normalize(mat3(WORLD_MATRIX) * NORMAL);
+	worldTangent = normalize(mat3(WORLD_MATRIX) * TANGENT);
+	worldBinormal = normalize(mat3(WORLD_MATRIX) * -BINORMAL);
+
+	if (expandShell)
+		VERTEX += NORMAL * furLength;
+
+	//---------------
+
+	vec3 FragmentPos = (WORLD_MATRIX * vec4(VERTEX, 1.0)).xyz;
+	TBN = transpose(mat3(worldTangent, worldBinormal, worldNormal));
+
+	TangentLightPos = TBN * lightWorldPos;
+	TangentFragmentPos  = TBN * FragmentPos;
+}
+
+vec3 TBProject(vec3 worldDir, float worldProjectLength)
+{
+	vec3 worldVec = vec3(dot(worldDir, worldTangent), dot(worldDir, worldBinormal), 0.0);
+	//return TBN * (normalize(worldVec) * worldProjectLength);
+	return worldVec * worldProjectLength;
+}
+
+void fragment()
+{
+	//vec3 viewDir = normalize(CAMERA_MATRIX[3].xyz - worldPosition);
+	vec3 worldViewDir = normalize(CAMERA_MATRIX[3].xyz - WORLD_MATRIX[3].xyz);
+
+	float cosRadian = dot(worldNormal, worldViewDir);
+	if (cosRadian == 1.0)
+	{
+		ALPHA = 0.0;
+	}
+	else 
+	{
+		vec2 uvNormalOffset;
+		if (cosRadian == 0.0)
+			uvNormalOffset = vec2(0.0, 0.0);
+		else
+		{
+			//-- furNormalProjectLen: 毛发无外力，自然状态下的投影长度
+			float furNormalProjectLen = furLength * tan(acos(cosRadian));
+			uvNormalOffset = TBProject(worldViewDir, furNormalProjectLen).xy;
+		}
+
+		//-- Force effect
+		vec3 force = normalize(forceDirection) * forceStrength + normalize(gravityDirection) * gravityStrength;
+		float totalForceStrength = length(force);
+
+		vec2 uvForceOffset = vec2(0.0, 0.0);
+		if (totalForceStrength > 0.0)
+		{
+			force = normalize(force);
+
+			// -- 规范化向量点乘为夹角余弦。实际需通过反余弦求出夹角后，再求余角，再做后续处理。1 - 夹角余弦为简化处理。
+			float furForceProjectLen = furLength * (1.0 - dot(worldNormal, force)) * tenacityFactor;	//-- 毛发外力状态下的投影长度
+			uvForceOffset = TBProject(force, furForceProjectLen).xy;
+		}
+
+		vec4 albedo = vec4(0., 0., 0., 0.);
+
+		for (int i = 0; i < sampleCount + 1; i++)
+		{
+			float currHeightFactor = float(sampleCount - i)/float(sampleCount);
+
+			vec2 uvOffset;
+			if (expandShell)
+				uvOffset = (uvNormalOffset - uvForceOffset) * (1.0 - currHeightFactor);
+			else
+				uvOffset = -(uvNormalOffset - uvForceOffset) * currHeightFactor;
+
+			//-- 矫正 UV
+			vec2 nosieFinalUV = nosieUV + uvOffset * nosieUVScale;
+			vec2 maskFinalUV = maskUV + uvOffset * maskUVScale;
+			vec2 diffFinalUV = UV + uvOffset * UVScale;
+		
+
+			float mask = texture(maskTex, maskFinalUV).r;
+			float alpha = texture(nosieTex, nosieFinalUV).r * mask;
+			alpha = step(currHeightFactor * currHeightFactor, alpha);
+			if (alpha == 0.0)
+				continue;
+
+			vec4 diffColor = texture(diffuseTex, diffFinalUV);
+			if (diffColor.a == 0.0)
+				continue;
+
+			alpha = 1.0 - currHeightFactor * currHeightFactor;
+			
+			diffColor.a *= alpha;
+			diffColor.rgb -= (pow(1.0 - currHeightFactor, 3)) * furShading;
+
+			float remain = 1. - albedo.a;
+			if (diffColor.a <= remain)
+				albedo += vec4(diffColor.rgb * remain * diffColor.a, diffColor.a);
+			else
+				albedo += vec4(diffColor.rgb * remain * diffColor.a, 1.0);
+
+			albedo = clamp(albedo, vec4(0., 0., 0., 0.), vec4(1., 1., 1., 1.));
+
+			if (albedo.a >= 1.0)
+				break;
+		}
+
+		//-- Alpha mode A 需要
+		if (enableMode && albedo.a < 1.)
+		{
+			float remain = 1. - albedo.a;
+
+			vec2 uvOffset = vec2(0.0);
+			if (expandShell)
+				uvOffset = (uvNormalOffset - uvForceOffset);
+
+			vec2 diffFinalUV = UV + uvOffset * UVScale;
+
+			vec4 diffColor = texture(diffuseTex, diffFinalUV);
+			albedo += vec4(diffColor.rgb * remain, 1.0);
+		}
+
+		//-- 光照部分
+		vec3 worldLight = normalize(lightWorldPos);
+		vec3 worldHalf = normalize(worldViewDir + worldLight);
+
+		//-- Godot 3.5 的 RIM 效果差异太大。不使用。
+		float rim = 1.0 - clamp(dot(worldViewDir, worldNormal), 0.0, 1.0);
+		albedo.rgb += vec4(rimColor.rgb * pow(rim, rimPower), 1.0).rgb;
+
+		vec3 ambient = ambient_factor * albedo.rgb;
+
+		vec3 diffuse = lightColor.rgb * albedo.rgb * max(dot(worldNormal, worldLight), 0.0);
+		vec3 specular = vec3(specular_factor) * lightColor.rgb * pow(max(dot(worldNormal, worldHalf), 0.0), shininess);
+
+		ALBEDO = ambient + diffuse + specular;
+		ALPHA = albedo.a;
+	}
+}
+"
